@@ -1241,6 +1241,21 @@ def _load_consolidation_cursor() -> dict[str, str]:
   return {str(key): str(when) for key, when in attempted.items()}
 
 
+def _review_progress() -> dict[str, str]:
+  """When each map's writer review last succeeded, through its publication.
+
+  Leads are counted from here, never from a mere attempt: a failed or
+  rejected review leaves the leads that made its map due still pending. A map
+  with no recorded success falls back to its attempt time.
+  """
+  reviewed = _read_consolidation_cursor().get("reviewed")
+  reviewed = reviewed if isinstance(reviewed, dict) else {}
+  return {
+    **_load_consolidation_cursor(),
+    **{str(key): str(when) for key, when in reviewed.items()},
+  }
+
+
 def _previously_omitted_members(moc_path: str) -> list[str]:
   omitted = _read_consolidation_cursor().get("omitted")
   if not isinstance(omitted, dict):
@@ -1254,6 +1269,10 @@ def _record_consolidation_attempt(
 ) -> None:
   cursor = _read_consolidation_cursor()
   attempted = _load_consolidation_cursor()
+  reviewed = cursor.get("reviewed")
+  reviewed = dict(reviewed) if isinstance(reviewed, dict) else {}
+  # Keep the last known progress before this attempt can overwrite it.
+  reviewed.setdefault(moc_path, attempted.get(moc_path, ""))
   attempted[moc_path] = datetime.now(UTC).isoformat()
   omitted_by_moc = cursor.get("omitted")
   if not isinstance(omitted_by_moc, dict):
@@ -1266,11 +1285,12 @@ def _record_consolidation_attempt(
     omitted_by_moc.pop(moc_path, None)
   _write_consolidation_cursor({
     **cursor, "schema": 1, "attempted": attempted, "omitted": omitted_by_moc,
+    "reviewed": reviewed,
   })
 
 
 def _mark_consolidated_through_publication(moc_paths: list[str]) -> None:
-  """Move consolidated maps' attempt time past this run's own update log.
+  """Move consolidated maps' attempt and review times past this run's log.
 
   The run's follow-ups are written at publication, after each map's item. A
   map's own follow-ups are not new leads for it, so only later ones count.
@@ -1279,9 +1299,14 @@ def _mark_consolidated_through_publication(moc_paths: list[str]) -> None:
     return
   cursor = _read_consolidation_cursor()
   attempted = _load_consolidation_cursor()
+  reviewed = cursor.get("reviewed")
+  reviewed = dict(reviewed) if isinstance(reviewed, dict) else {}
   now = datetime.now(UTC).isoformat()
   attempted.update({path: now for path in moc_paths})
-  _write_consolidation_cursor({**cursor, "attempted": attempted})
+  reviewed.update({path: now for path in moc_paths})
+  _write_consolidation_cursor({
+    **cursor, "attempted": attempted, "reviewed": reviewed,
+  })
 
 
 def _write_consolidation_cursor(cursor: dict) -> None:
@@ -1373,6 +1398,7 @@ def _consolidation_candidates(
   usage = note_usage_evidence() if usage is None else usage
   cursor = _read_consolidation_cursor()
   attempted = _load_consolidation_cursor()
+  progress = _review_progress()
   fingerprints = cursor.get("fingerprints")
   fingerprints = fingerprints if isinstance(fingerprints, dict) else {}
   usage_seen = cursor.get("usage")
@@ -1389,9 +1415,9 @@ def _consolidation_candidates(
     )
     led = bool(_consolidation_leads(
       [Path(moc_path).stem, *(Path(path).stem for path in members)],
-      since=attempted.get(moc_path, ""),
+      since=progress.get(moc_path, ""),
       new_input_only=True,
-      reach_back=attempted.get(moc_path, ""),
+      reach_back=progress.get(moc_path, ""),
     ))
     if changed or led:
       due.append(moc_path)
@@ -1556,7 +1582,7 @@ def _consolidation_item(
     "omitted_member_paths": omitted,
     "leads": _consolidation_leads(
       [moc_id, *member_ids],
-      reach_back=_load_consolidation_cursor().get(moc_path, ""),
+      reach_back=_review_progress().get(moc_path, ""),
     ),
     "member_usage": {
       item["path"]: usage.get(item["path"], {"needed": 0, "overreach": 0})

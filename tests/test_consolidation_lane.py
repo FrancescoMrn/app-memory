@@ -139,6 +139,17 @@ def _settle(staging: Path, *mocs: str, usage: dict | None = None) -> None:
     memory_runner._record_consolidation_fingerprint(
       staging, f"mocs/{moc}.md", usage or {},
     )
+  memory_runner._mark_consolidated_through_publication(
+    [f"mocs/{moc}.md" for moc in mocs],
+  )
+
+
+def _reviewed_long_ago(moc: str) -> None:
+  """Backdate a map's last successful review, as after many busy nights."""
+  cursor = json.loads(memory_runner._CONSOLIDATION_CURSOR.read_text())
+  for key in ("attempted", "reviewed"):
+    cursor[key][f"mocs/{moc}.md"] = "2026-09-30T04:30:00+00:00"
+  memory_runner._CONSOLIDATION_CURSOR.write_text(json.dumps(cursor))
 
 
 def _publish_followups(
@@ -223,9 +234,7 @@ def test_a_lead_reaches_its_map_however_many_nights_pass_first(state, tmp_path):
   staging = tmp_path / "staging"
   _shared_graph(staging)
   _settle(staging, "people", "projects")
-  cursor = json.loads(memory_runner._CONSOLIDATION_CURSOR.read_text())
-  cursor["attempted"]["mocs/projects.md"] = "2026-09-30T04:30:00+00:00"
-  memory_runner._CONSOLIDATION_CURSOR.write_text(json.dumps(cursor))
+  _reviewed_long_ago("projects")
   _publish_followups(
     state, ["Projects' cue for c reads stale."], consolidated=["people"],
     day="2026-10-01", input_leads=[],
@@ -246,9 +255,7 @@ def test_a_map_starved_for_nights_still_wakes_for_an_input_lead(state, tmp_path)
   staging = tmp_path / "staging"
   _shared_graph(staging)
   _settle(staging, "people", "projects")
-  cursor = json.loads(memory_runner._CONSOLIDATION_CURSOR.read_text())
-  cursor["attempted"]["mocs/projects.md"] = "2026-09-30T04:30:00+00:00"
-  memory_runner._CONSOLIDATION_CURSOR.write_text(json.dumps(cursor))
+  _reviewed_long_ago("projects")
   lead = "Filed a fact; c in projects needs a sharper cue."
   _publish_followups(
     state, [lead], consolidated=["people"], day="2026-10-01", input_leads=[lead],
@@ -262,6 +269,86 @@ def test_a_map_starved_for_nights_still_wakes_for_an_input_lead(state, tmp_path)
   assert memory_runner._consolidation_candidates(staging, {}) == [
     "mocs/projects.md",
   ]
+
+
+@pytest.mark.parametrize("upgraded", [False, True])
+def test_a_lead_only_map_whose_review_fails_is_retried_with_its_lead(
+  state, monkeypatch, tmp_path, upgraded,
+):
+  staging = tmp_path / "staging"
+  _shared_graph(staging)
+  _settle(staging, "people", "projects")
+  if upgraded:
+    # A cursor written before successful reviews were kept apart.
+    cursor = json.loads(memory_runner._CONSOLIDATION_CURSOR.read_text())
+    cursor.pop("reviewed", None)
+    memory_runner._CONSOLIDATION_CURSOR.write_text(json.dumps(cursor))
+  lead = "Filed a fact; c in projects needs a sharper cue."
+  _publish_followups(state, [lead], consolidated=["people"], input_leads=[lead])
+  assert memory_runner._consolidation_candidates(staging, {}) == [
+    "mocs/projects.md",
+  ]
+
+  # The writer fails on that one item: nothing is accepted.
+  graph = json.loads((staging / "graph.json").read_text())
+  monkeypatch.setattr(
+    memory_runner, "_proposal",
+    lambda *_args, **_kwargs: memory_runner.ProposalOutcome(
+      status="degraded", proposal=None, provider=None, model=None,
+      attempted_agents=[{"provider": "claude", "model": "m", "supported": True}],
+    ),
+  )
+  result = memory_runner._consolidate_batches(
+    7, staging, graph, [], [], memory_runner.ProviderPool([]),
+  )
+  assert (result.accepted_mocs, result.rejected_moc_count) == ([], 1)
+
+  # The next night retries it, and the lead still reaches the review.
+  assert memory_runner._consolidation_candidates(staging, {}) == [
+    "mocs/projects.md",
+  ]
+  item = memory_runner._consolidation_item(staging, "mocs/projects.md", {})
+  assert lead in item["leads"]
+
+  # Once a review succeeds, the same lead wakes nothing again.
+  _settle(staging, "projects")
+  assert memory_runner._consolidation_candidates(staging, {}) == []
+
+
+def test_a_failed_review_still_wakes_and_delivers_after_busy_nights(
+  state, monkeypatch, tmp_path,
+):
+  staging = tmp_path / "staging"
+  _shared_graph(staging)
+  _settle(staging, "people", "projects")
+  _reviewed_long_ago("projects")
+  lead = "Filed a fact; c in projects needs a sharper cue."
+  _publish_followups(
+    state, [lead], consolidated=["people"], day="2026-10-01", input_leads=[lead],
+  )
+  graph = json.loads((staging / "graph.json").read_text())
+  monkeypatch.setattr(
+    memory_runner, "_proposal",
+    lambda *_args, **_kwargs: memory_runner.ProposalOutcome(
+      status="degraded", proposal=None, provider=None, model=None,
+      attempted_agents=[{"provider": "claude", "model": "m", "supported": True}],
+    ),
+  )
+  memory_runner._consolidate_batches(
+    7, staging, graph, [], [], memory_runner.ProviderPool([]),
+  )
+  # Busy nights elsewhere push the lead out of the three most recent logs.
+  for day in ("2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05"):
+    _publish_followups(
+      state, ["Routine note about b."], consolidated=["people"], day=day,
+      input_leads=[],
+    )
+
+  assert memory_runner._consolidation_candidates(staging, {}) == [
+    "mocs/projects.md",
+  ]
+  item = memory_runner._consolidation_item(staging, "mocs/projects.md", {})
+  assert lead in item["leads"]
 
 
 def test_rotation_waits_for_usage_evidence_the_writer_has_not_seen(state, tmp_path):
